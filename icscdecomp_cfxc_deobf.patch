@@ -1,0 +1,2210 @@
+diff --git a/ICSharpCode.Decompiler/Ast/Transforms/DelegateConstruction.cs b/ICSharpCode.Decompiler/Ast/Transforms/DelegateConstruction.cs
+index 6cbb6af..75e5ba6 100644
+--- a/ICSharpCode.Decompiler/Ast/Transforms/DelegateConstruction.cs
++++ b/ICSharpCode.Decompiler/Ast/Transforms/DelegateConstruction.cs
+@@ -168,7 +168,7 @@ static MethodBaseSig GetMethodBaseSig(ITypeDefOrRef type, MethodBaseSig msig, IL
+ 		
+ 		internal static bool IsAnonymousMethod(DecompilerContext context, MethodDef method)
+ 		{
+-			if (method == null || !(method.HasGeneratedName() || method.Name.Contains("$")))
++			if (method == null || !(method.IsCompilerGeneratedOrIsInCompilerGeneratedClass() || method.Name.Contains("$")))
+ 				return false;
+ 			if (!(method.IsCompilerGenerated() || IsPotentialClosure(context, method.DeclaringType)))
+ 				return false;
+diff --git a/ICSharpCode.Decompiler/ILAst/ILAstOptimizer.cs b/ICSharpCode.Decompiler/ILAst/ILAstOptimizer.cs
+index 4fcfed0..756eb6b 100644
+--- a/ICSharpCode.Decompiler/ILAst/ILAstOptimizer.cs
++++ b/ICSharpCode.Decompiler/ILAst/ILAstOptimizer.cs
+@@ -228,17 +228,22 @@ internal void Optimize(DecompilerContext context, ILBlock method, AutoPropertyPr
+ 				if (abortBeforeStep == ILAstOptimizationStep.CopyPropagation) return;
+ 				inlining1.CopyPropagation(Optimize_List_ILNode);
+ 
+-				if (abortBeforeStep == ILAstOptimizationStep.YieldReturn) return;
+-				YieldReturnDecompiler.Run(context, method, autoPropertyProvider, Optimize_List_ILNode, del_getILInlining, Optimize_List_ILExpression, Optimize_List_ILBlock, Optimize_Dict_ILLabel_Int32);
+-				var yrd = AsyncDecompiler.RunStep1(context, method, autoPropertyProvider, Optimize_List_ILExpression, Optimize_List_ILBlock, Optimize_Dict_ILLabel_Int32);
+-
+-				if (abortBeforeStep == ILAstOptimizationStep.AsyncAwait) return;
+-				yrd?.RunStep2(context, method, Optimize_List_ILExpression, Optimize_List_ILBlock, Optimize_Dict_ILLabel_Int32, Optimize_List_ILNode, del_getILInlining);
+-
+-				if (abortBeforeStep == ILAstOptimizationStep.PropertyAccessInstructions) return;
++                var needs_deobf = GetLoopsAndConditions(context).NeedsDeobf(method, autoPropertyProvider);
++                if (!needs_deobf)
++                {
++                    if (abortBeforeStep == ILAstOptimizationStep.YieldReturn) return;
++                        YieldReturnDecompiler.Run(context, method, autoPropertyProvider, Optimize_List_ILNode, del_getILInlining, Optimize_List_ILExpression, Optimize_List_ILBlock, Optimize_Dict_ILLabel_Int32);
++                }
++
++                // misnomer?
++                var yrd = AsyncDecompiler.RunStep1(context, method, autoPropertyProvider, Optimize_List_ILExpression, Optimize_List_ILBlock, Optimize_Dict_ILLabel_Int32);
++                if (abortBeforeStep == ILAstOptimizationStep.AsyncAwait) return;
++                yrd?.RunStep2(context, method, Optimize_List_ILExpression, Optimize_List_ILBlock, Optimize_Dict_ILLabel_Int32, Optimize_List_ILNode, del_getILInlining);
++
++                if (abortBeforeStep == ILAstOptimizationStep.PropertyAccessInstructions) return;
+ 				IntroducePropertyAccessInstructions(method);
+ 
+-				if (abortBeforeStep == ILAstOptimizationStep.SplitToMovableBlocks) return;
++                if (abortBeforeStep == ILAstOptimizationStep.SplitToMovableBlocks) return;
+ 				foreach (ILBlock block in method.GetSelfAndChildrenRecursive<ILBlock>(Optimize_List_ILBlock)) {
+ 					SplitToBasicBlocks(block);
+ 				}
+@@ -317,7 +322,73 @@ internal void Optimize(DecompilerContext context, ILBlock method, AutoPropertyPr
+ 					} while (modified);
+ 				}
+ 
+-				if (abortBeforeStep == ILAstOptimizationStep.FindLoops) return;
++                if (needs_deobf)
++                {
++                    foreach (ILBlock block in method.GetSelfAndChildrenRecursive<ILBlock>(Optimize_List_ILBlock))
++                    {
++                        GetLoopsAndConditions(context).Deobf(block);
++                    }
++
++                    if (abortBeforeStep == ILAstOptimizationStep.YieldReturn) return;
++                    YieldReturnDecompiler.Run(context, method, autoPropertyProvider, Optimize_List_ILNode, del_getILInlining, Optimize_List_ILExpression, Optimize_List_ILBlock, Optimize_Dict_ILLabel_Int32);
++
++                    if (method.Body.Count > 0 && !(method.Body[0] is ILBasicBlock))
++                    {
++                        foreach (ILBlock block in method.GetSelfAndChildrenRecursive<ILBlock>(Optimize_List_ILBlock))
++                            SplitToBasicBlocks(block);
++
++                        bool modified;
++                        do
++                        {
++                            modified = false;
++
++                            foreach (ILBlock block in method.GetSelfAndChildrenRecursive<ILBlock>(Optimize_List_ILBlock))
++                                modified |= GetLoopsAndConditions(context).Fixup(method, block);
++                        } while (modified);
++                    }
++
++                    // repeat this stuff to prettyify our output. may wanna skip some steps, not sure
++                    foreach (ILBlock block in method.GetSelfAndChildrenRecursive<ILBlock>(Optimize_List_ILBlock))
++                    {
++                        bool modified;
++                        do
++                        {
++                            modified = false;
++                            modified |= block.RunOptimization(GetSimpleControlFlow(context, method).SimplifyShortCircuit);
++                            modified |= block.RunOptimization(GetSimpleControlFlow(context, method).SimplifyTernaryOperator);
++                            modified |= block.RunOptimization(GetSimpleControlFlow(context, method).SimplifyNullCoalescing);
++                            modified |= block.RunOptimization(GetSimpleControlFlow(context, method).JoinBasicBlocks);
++                            modified |= block.RunOptimization(SimplifyLogicNot);
++                            modified |= block.RunOptimization(SimplifyShiftOperators);
++                            //modified |= block.RunOptimization(TypeConversionSimplifications);
++                            modified |= block.RunOptimization(SimplifyLdObjAndStObj);
++                            modified |= block.RunOptimization(GetSimpleControlFlow(context, method).SimplifyCustomShortCircuit);
++                            modified |= block.RunOptimization(SimplifyLiftedOperators);
++                            //modified |= block.RunOptimization(TransformArrayInitializers);
++                            //modified |= block.RunOptimization(TransformMultidimensionalArrayInitializers);
++                            //modified |= block.RunOptimization(TransformObjectInitializers);
++                            if (context.Settings.MakeAssignmentExpressions)
++                            {
++                                modified |= block.RunOptimization(MakeAssignmentExpression);
++                            }
++                            modified |= block.RunOptimization(MakeCompoundAssignments);
++                            if (context.Settings.IntroduceIncrementAndDecrement)
++                            {
++                                modified |= block.RunOptimization(IntroducePostIncrement);
++                            }
++                            if (context.Settings.ExpressionTrees)
++                            {
++                                modified |= block.RunOptimization(InlineExpressionTreeParameterDeclarations);
++                            }
++                            modified |= GetILInlining(method).InlineAllInBlock(block);
++                            GetILInlining(method).CopyPropagation(Optimize_List_ILNode);
++
++                        } while (modified);
++                    }
++                }
++                // --
++
++                if (abortBeforeStep == ILAstOptimizationStep.FindLoops) return;
+ 				foreach (ILBlock block in method.GetSelfAndChildrenRecursive<ILBlock>(Optimize_List_ILBlock)) {
+ 					GetLoopsAndConditions(context).FindLoops(block);
+ 				}
+@@ -1425,7 +1496,7 @@ internal static void RemoveRedundantCode(DecompilerContext context, ILBlock meth
+ 				foreach (var target in e.GetBranchTargets())
+ 					labelRefCount[target] = labelRefCount.GetOrDefault(target) + 1;
+ 			}
+-			
++            
+ 			foreach(ILBlock block in method.GetSelfAndChildrenRecursive<ILBlock>(listBlock)) {
+ 				List<ILNode> body = block.Body;
+ 				List<ILNode> newBody = new List<ILNode>(body.Count);
+@@ -1648,7 +1719,7 @@ void IntroducePropertyAccessInstructions(ILExpression expr, ILExpression parentE
+ 		/// The method adds necessary branches to make control flow between blocks
+ 		/// explicit and thus order independent.
+ 		/// </summary>
+-		void SplitToBasicBlocks(ILBlock block)
++		internal void SplitToBasicBlocks(ILBlock block)
+ 		{
+ 			List<ILNode> basicBlocks = new List<ILNode>();
+ 			
+diff --git a/ICSharpCode.Decompiler/ILAst/LoopsAndConditions.cs b/ICSharpCode.Decompiler/ILAst/LoopsAndConditions.cs
+index d1e6dc6..ba59cda 100644
+--- a/ICSharpCode.Decompiler/ILAst/LoopsAndConditions.cs
++++ b/ICSharpCode.Decompiler/ILAst/LoopsAndConditions.cs
+@@ -16,469 +16,1141 @@
+ // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ // DEALINGS IN THE SOFTWARE.
+ 
++using System;
+ using System.Collections.Generic;
+ using System.Linq;
+ using dnSpy.Contracts.Decompiler;
+ using ICSharpCode.Decompiler.FlowAnalysis;
+ 
+-namespace ICSharpCode.Decompiler.ILAst {
+-	/// <summary>
+-	/// Description of LoopsAndConditions.
+-	/// </summary>
+-	public class LoopsAndConditions
+-	{
+-		readonly Dictionary<ILLabel, ControlFlowNode> labelToCfNode = new Dictionary<ILLabel, ControlFlowNode>();
+-		
+-		DecompilerContext context;
+-		
+-		uint nextLabelIndex;
+-		
+-		public LoopsAndConditions(DecompilerContext context)
+-		{
+-			Initialize(context);
+-		}
+-
+-		public void Initialize(DecompilerContext context)
+-		{
+-			this.context = context;
+-			this.labelToCfNode.Clear();
+-			this.nextLabelIndex = 0;
+-		}
+-		
+-		public void FindLoops(ILBlock block)
+-		{
+-			if (block.Body.Count > 0) {
+-				ControlFlowGraph graph;
+-				graph = BuildGraph(block.Body, (ILLabel)block.EntryGoto.Operand);
+-				graph.ComputeDominance(context.CancellationToken);
+-				graph.ComputeDominanceFrontier();
+-				//TODO: Keep BinSpans when writing to Body
+-				block.Body = FindLoops(new HashSet<ControlFlowNode>(graph.Nodes.Skip(3)), graph.EntryPoint, false);
+-			}
+-		}
+-		
+-		public void FindConditions(ILBlock block)
+-		{
+-			if (block.Body.Count > 0) {
+-				ControlFlowGraph graph;
+-				graph = BuildGraph(block.Body, (ILLabel)block.EntryGoto.Operand);
+-				graph.ComputeDominance(context.CancellationToken);
+-				graph.ComputeDominanceFrontier();
+-				//TODO: Keep BinSpans when writing to Body
+-				block.Body = FindConditions(new HashSet<ControlFlowNode>(graph.Nodes.Skip(3)), graph.EntryPoint);
+-			}
+-		}
+-
+-		readonly ControlFlowGraph cached_ControlFlowGraph = new ControlFlowGraph();
+-		ControlFlowGraph BuildGraph(List<ILNode> nodes, ILLabel entryLabel)
+-		{
+-			cached_ControlFlowGraph.Nodes.Clear();
+-			int index = 0;
+-			var cfNodes = cached_ControlFlowGraph.Nodes;
+-			ControlFlowNode entryPoint = new ControlFlowNode(index++, 0, ControlFlowNodeType.EntryPoint);
+-			cfNodes.Add(entryPoint);
+-			ControlFlowNode regularExit = new ControlFlowNode(index++, null, ControlFlowNodeType.RegularExit);
+-			cfNodes.Add(regularExit);
+-			ControlFlowNode exceptionalExit = new ControlFlowNode(index++, null, ControlFlowNodeType.ExceptionalExit);
+-			cfNodes.Add(exceptionalExit);
+-
+-			// Create graph nodes
+-			labelToCfNode.Clear();
+-			Dictionary<ILNode, ControlFlowNode> astNodeToCfNode = new Dictionary<ILNode, ControlFlowNode>();
+-			List<ILLabel> listLabels = null;
+-			foreach(ILBasicBlock node in nodes) {
+-				ControlFlowNode cfNode = new ControlFlowNode(index++, null, ControlFlowNodeType.Normal);
+-				cfNodes.Add(cfNode);
+-				astNodeToCfNode[node] = cfNode;
+-				cfNode.UserData = node;
+-				
+-				// Find all contained labels
+-				foreach(ILLabel label in node.GetSelfAndChildrenRecursive<ILLabel>(listLabels ?? (listLabels = new List<ILLabel>()))) {
+-					labelToCfNode[label] = cfNode;
+-				}
+-			}
+-			
+-			// Entry endge
+-			ControlFlowNode entryNode = labelToCfNode[entryLabel];
+-			ControlFlowEdge entryEdge = new ControlFlowEdge(entryPoint, entryNode, JumpType.Normal);
+-			entryPoint.Outgoing.Add(entryEdge);
+-			entryNode.Incoming.Add(entryEdge);
+-
+-			// Create edges
+-			List<ILExpression> listExpressions = null;
+-			foreach(ILBasicBlock node in nodes) {
+-				ControlFlowNode source = astNodeToCfNode[node];
+-				
+-				// Find all branches
+-				foreach(ILLabel target in node.GetSelfAndChildrenRecursive<ILExpression>(listExpressions ?? (listExpressions = new List<ILExpression>()), e => e.IsBranch()).SelectMany(e => e.GetBranchTargets())) {
+-					ControlFlowNode destination;
+-					// Labels which are out of out scope will not be in the collection
+-					// Insert self edge only if we are sure we are a loop
+-					if (labelToCfNode.TryGetValue(target, out destination) && (destination != source || target == node.Body.FirstOrDefault())) {
+-						ControlFlowEdge edge = new ControlFlowEdge(source, destination, JumpType.Normal);
+-						source.Outgoing.Add(edge);
+-						destination.Incoming.Add(edge);
+-					}
+-				}
+-			}
+-
+-			return cached_ControlFlowGraph;
+-		}
+-		
+-		List<ILNode> FindLoops(HashSet<ControlFlowNode> scope, ControlFlowNode entryPoint, bool excludeEntryPoint)
+-		{
+-			List<ILNode> result = new List<ILNode>();
+-			
+-			// Do not modify entry data
+-			scope = new HashSet<ControlFlowNode>(scope);
+-			
+-			Queue<ControlFlowNode> agenda  = new Queue<ControlFlowNode>();
+-			agenda.Enqueue(entryPoint);
+-			while(agenda.Count > 0) {
+-				ControlFlowNode node = agenda.Dequeue();
+-				
+-				// If the node is a loop header
+-				if (scope.Contains(node)
+-				    && node.DominanceFrontier.Contains(node)
+-				    && (node != entryPoint || !excludeEntryPoint))
+-				{
+-					HashSet<ControlFlowNode> loopContents = FindLoopContent(scope, node);
+-					
+-					// If the first expression is a loop condition
+-					ILBasicBlock basicBlock = (ILBasicBlock)node.UserData;
+-					ILExpression condExpr;
+-					ILLabel trueLabel;
+-					ILLabel falseLabel;
+-					// It has to be just brtrue - any preceding code would introduce goto
+-					if(basicBlock.MatchSingleAndBr(ILCode.Brtrue, out trueLabel, out condExpr, out falseLabel))
+-					{
+-						ControlFlowNode trueTarget;
+-						labelToCfNode.TryGetValue(trueLabel, out trueTarget);
+-						ControlFlowNode falseTarget;
+-						labelToCfNode.TryGetValue(falseLabel, out falseTarget);
+-						
+-						// If one point inside the loop and the other outside
+-						if ((!loopContents.Contains(trueTarget) && loopContents.Contains(falseTarget)) ||
+-						    (loopContents.Contains(trueTarget) && !loopContents.Contains(falseTarget)) )
+-						{
+-							loopContents.RemoveOrThrow(node);
+-							scope.RemoveOrThrow(node);
+-							
+-							// If false means enter the loop
+-							if (loopContents.Contains(falseTarget) || falseTarget == node)
+-							{
+-								// Negate the condition
+-								condExpr = new ILExpression(ILCode.LogicNot, null, condExpr);
+-								ILLabel tmp = trueLabel;
+-								trueLabel = falseLabel;
+-								falseLabel = tmp;
+-							}
+-							
+-							ControlFlowNode postLoopTarget;
+-							labelToCfNode.TryGetValue(falseLabel, out postLoopTarget);
+-							if (postLoopTarget != null) {
+-								// Pull more nodes into the loop
+-								HashSet<ControlFlowNode> postLoopContents = FindDominatedNodes(scope, postLoopTarget);
+-								var pullIn = scope.Except(postLoopContents).Where(n => node.Dominates(n));
+-								loopContents.UnionWith(pullIn);
+-							}
+-							
+-							// Use loop to implement the brtrue
+-							var tail = basicBlock.Body.RemoveTail(ILCode.Brtrue, ILCode.Br);
+-							ILWhileLoop whileLoop;
+-							basicBlock.Body.Add(whileLoop = new ILWhileLoop() {
+-								Condition = condExpr,
+-								BodyBlock = new ILBlock(CodeBracesRangeFlags.LoopBraces) {
+-									EntryGoto = new ILExpression(ILCode.Br, trueLabel),
+-									Body = FindLoops(loopContents, node, false)
+-								}
+-							});
+-							if (context.CalculateBinSpans) {
+-								whileLoop.BinSpans.AddRange(tail[0].BinSpans);  // no recursive add
+-								tail[1].AddSelfAndChildrenRecursiveBinSpans(whileLoop.BinSpans);
+-							}
+-							basicBlock.Body.Add(new ILExpression(ILCode.Br, falseLabel));
+-							result.Add(basicBlock);
+-							
+-							scope.ExceptWith(loopContents);
+-						}
+-					}
+-					
+-					// Fallback method: while(true)
+-					if (scope.Contains(node)) {
+-						result.Add(new ILBasicBlock() {
+-							Body = new List<ILNode>() {
+-								new ILLabel() { Name = "Loop_" + (nextLabelIndex++).ToString() },
+-								new ILWhileLoop() {
+-									BodyBlock = new ILBlock(CodeBracesRangeFlags.LoopBraces) {
+-										EntryGoto = new ILExpression(ILCode.Br, (ILLabel)basicBlock.Body.First()),
+-										Body = FindLoops(loopContents, node, true)
+-									}
+-								},
+-							},
+-						});
+-						
+-						scope.ExceptWith(loopContents);
+-					}
+-				}
+-
+-				// Using the dominator tree should ensure we find the the widest loop first
+-				foreach(var child in node.DominatorTreeChildren) {
+-					agenda.Enqueue(child);
+-				}
+-			}
+-			
+-			// Add whatever is left
+-			foreach(var node in scope) {
+-				result.Add((ILNode)node.UserData);
+-			}
+-			scope.Clear();
+-			
+-			return result;
+-		}
+-		
+-		List<ILNode> FindConditions(HashSet<ControlFlowNode> scope, ControlFlowNode entryNode)
+-		{
+-			List<ILNode> result = new List<ILNode>();
+-			
+-			// Do not modify entry data
+-			scope = new HashSet<ControlFlowNode>(scope);
+-			
+-			Stack<ControlFlowNode> agenda  = new Stack<ControlFlowNode>();
+-			agenda.Push(entryNode);
+-			while(agenda.Count > 0) {
+-				ControlFlowNode node = agenda.Pop();
+-				
+-				// Find a block that represents a simple condition
+-				if (scope.Contains(node)) {
+-					
+-					ILBasicBlock block = (ILBasicBlock)node.UserData;
+-					
+-					{
+-						// Switch
+-						ILLabel[] caseLabels;
+-						ILExpression switchArg;
+-						ILLabel fallLabel;
+-						if (block.MatchLastAndBr(ILCode.Switch, out caseLabels, out switchArg, out fallLabel)) {
+-							
+-							// Replace the switch code with ILSwitch
+-							ILSwitch ilSwitch = new ILSwitch() { Condition = switchArg };
+-							var tail = block.Body.RemoveTail(ILCode.Switch, ILCode.Br);
+-							if (context.CalculateBinSpans) {
+-								ilSwitch.BinSpans.AddRange(tail[0].BinSpans);   // no recursive add
+-								tail[1].AddSelfAndChildrenRecursiveBinSpans(ilSwitch.BinSpans);
+-							}
+-							block.Body.Add(ilSwitch);
+-							block.Body.Add(new ILExpression(ILCode.Br, fallLabel));
+-							result.Add(block);
+-
+-							// Remove the item so that it is not picked up as content
+-							scope.RemoveOrThrow(node);
+-							
+-							// Find the switch offset
+-							int addValue = 0;
+-							List<ILExpression> subArgs;
+-							if (ilSwitch.Condition.Match(ILCode.Sub, out subArgs) && subArgs[1].Match(ILCode.Ldc_I4, out addValue)) {
+-								var old = ilSwitch.Condition;
+-								ilSwitch.Condition = subArgs[0];
+-								if (context.CalculateBinSpans) {
+-									ilSwitch.Condition.BinSpans.AddRange(old.BinSpans); // no recursive add
+-									for (int i = 1; i < subArgs.Count; i++)
+-										subArgs[i].AddSelfAndChildrenRecursiveBinSpans(ilSwitch.Condition.BinSpans);
+-								}
+-							}
+-							
+-							// Pull in code of cases
+-							ControlFlowNode fallTarget = null;
+-							labelToCfNode.TryGetValue(fallLabel, out fallTarget);
+-							
+-							HashSet<ControlFlowNode> frontiers = new HashSet<ControlFlowNode>();
+-							if (fallTarget != null)
+-								frontiers.UnionWith(fallTarget.DominanceFrontier.Except(new [] { fallTarget }));
+-							
+-							foreach(ILLabel condLabel in caseLabels) {
+-								ControlFlowNode condTarget;
+-								labelToCfNode.TryGetValue(condLabel, out condTarget);
+-								if (condTarget != null)
+-									frontiers.UnionWith(condTarget.DominanceFrontier.Except(new [] { condTarget }));
+-							}
+-
+-							bool includedDefault = false;
+-							for (int i = 0; i < caseLabels.Length; i++) {
+-								ILLabel condLabel = caseLabels[i];
+-								
+-								// Find or create new case block
+-								ILSwitch.CaseBlock caseBlock = ilSwitch.CaseBlocks.FirstOrDefault(b => b.EntryGoto.Operand == condLabel);
+-								if (caseBlock == null) {
+-									caseBlock = new ILSwitch.CaseBlock() {
+-										Values = new List<int>(),
+-										EntryGoto = new ILExpression(ILCode.Br, condLabel)
+-									};
+-									ilSwitch.CaseBlocks.Add(caseBlock);
+-									if (!includedDefault && condLabel == fallLabel) {
+-										includedDefault = true;
+-										block.Body.RemoveTail(ILCode.Br);
+-										caseBlock.Values = null;
+-									}
+-									
+-									ControlFlowNode condTarget = null;
+-									labelToCfNode.TryGetValue(condLabel, out condTarget);
+-									if (condTarget != null && !frontiers.Contains(condTarget)) {
+-										HashSet<ControlFlowNode> content = FindDominatedNodes(scope, condTarget);
+-										scope.ExceptWith(content);
+-										caseBlock.Body.AddRange(FindConditions(content, condTarget));
+-										// Add explicit break which should not be used by default, but the goto removal might decide to use it
+-										caseBlock.Body.Add(new ILBasicBlock() {
+-											Body = {
+-												new ILLabel() { Name = "SwitchBreak_" + (nextLabelIndex++).ToString() },
+-												new ILExpression(ILCode.LoopOrSwitchBreak, null)
+-											}
+-										});
+-									}
+-								}
+-								caseBlock.Values?.Add(i + addValue);
+-							}
+-							
+-							// Heuristis to determine if we want to use fallthough as default case
+-							if (!includedDefault && fallTarget != null && !frontiers.Contains(fallTarget)) {
+-								HashSet<ControlFlowNode> content = FindDominatedNodes(scope, fallTarget);
+-								if (content.Any()) {
+-									var caseBlock = new ILSwitch.CaseBlock() { EntryGoto = new ILExpression(ILCode.Br, fallLabel) };
+-									ilSwitch.CaseBlocks.Add(caseBlock);
+-									tail = block.Body.RemoveTail(ILCode.Br);
+-									if (context.CalculateBinSpans)
+-										tail[0].AddSelfAndChildrenRecursiveBinSpans(caseBlock.BinSpans);
+-									
+-									scope.ExceptWith(content);
+-									caseBlock.Body.AddRange(FindConditions(content, fallTarget));
+-									// Add explicit break which should not be used by default, but the goto removal might decide to use it
+-									caseBlock.Body.Add(new ILBasicBlock() {
+-										Body = {
+-											new ILLabel() { Name = "SwitchBreak_" + (nextLabelIndex++).ToString() },
+-											new ILExpression(ILCode.LoopOrSwitchBreak, null)
+-										}
+-									});
+-								}
+-							}
+-						}
+-						
+-						// Two-way branch
+-						ILExpression condExpr;
+-						ILLabel trueLabel;
+-						ILLabel falseLabel;
+-						if(block.MatchLastAndBr(ILCode.Brtrue, out trueLabel, out condExpr, out falseLabel)) {
+-							
+-							// Swap bodies since that seems to be the usual C# order
+-							ILLabel temp = trueLabel;
+-							trueLabel = falseLabel;
+-							falseLabel = temp;
+-							condExpr = new ILExpression(ILCode.LogicNot, null, condExpr);
+-							
+-							// Convert the brtrue to ILCondition
+-							ILCondition ilCond = new ILCondition() {
+-								Condition  = condExpr,
+-								TrueBlock  = new ILBlock(CodeBracesRangeFlags.ConditionalBraces) { EntryGoto = new ILExpression(ILCode.Br, trueLabel) },
+-								FalseBlock = new ILBlock(CodeBracesRangeFlags.ConditionalBraces) { EntryGoto = new ILExpression(ILCode.Br, falseLabel) }
+-							};
+-							var tail = block.Body.RemoveTail(ILCode.Brtrue, ILCode.Br);
+-							if (context.CalculateBinSpans) {
+-								condExpr.BinSpans.AddRange(tail[0].BinSpans);   // no recursive add
+-								tail[1].AddSelfAndChildrenRecursiveBinSpans(ilCond.FalseBlock.BinSpans);
+-							}
+-							block.Body.Add(ilCond);
+-							result.Add(block);
+-							
+-							// Remove the item immediately so that it is not picked up as content
+-							scope.RemoveOrThrow(node);
+-							
+-							ControlFlowNode trueTarget = null;
+-							labelToCfNode.TryGetValue(trueLabel, out trueTarget);
+-							ControlFlowNode falseTarget = null;
+-							labelToCfNode.TryGetValue(falseLabel, out falseTarget);
+-							
+-							// Pull in the conditional code
+-							if (trueTarget != null && HasSingleEdgeEnteringBlock(trueTarget)) {
+-								HashSet<ControlFlowNode> content = FindDominatedNodes(scope, trueTarget);
+-								scope.ExceptWith(content);
+-								ilCond.TrueBlock.Body.AddRange(FindConditions(content, trueTarget));
+-							}
+-							if (falseTarget != null && HasSingleEdgeEnteringBlock(falseTarget)) {
+-								HashSet<ControlFlowNode> content = FindDominatedNodes(scope, falseTarget);
+-								scope.ExceptWith(content);
+-								ilCond.FalseBlock.Body.AddRange(FindConditions(content, falseTarget));
+-							}
+-						}
+-					}
+-					
+-					// Add the node now so that we have good ordering
+-					if (scope.Contains(node)) {
+-						result.Add((ILNode)node.UserData);
+-						scope.Remove(node);
+-					}
+-				}
+-
+-				// depth-first traversal of dominator tree
+-				for (int i = node.DominatorTreeChildren.Count - 1; i >= 0; i--) {
+-					agenda.Push(node.DominatorTreeChildren[i]);
+-				}
+-			}
+-			
+-			// Add whatever is left
+-			foreach(var node in scope) {
+-				result.Add((ILNode)node.UserData);
+-			}
+-			
+-			return result;
+-		}
+-		
+-		static bool HasSingleEdgeEnteringBlock(ControlFlowNode node)
+-		{
+-			return node.Incoming.Count(edge => !node.Dominates(edge.Source)) == 1;
+-		}
+-		
+-		static HashSet<ControlFlowNode> FindDominatedNodes(HashSet<ControlFlowNode> scope, ControlFlowNode head)
+-		{
+-			HashSet<ControlFlowNode> agenda = new HashSet<ControlFlowNode>();
+-			HashSet<ControlFlowNode> result = new HashSet<ControlFlowNode>();
+-			agenda.Add(head);
+-			
+-			while(agenda.Count > 0) {
+-				ControlFlowNode addNode = agenda.First();
+-				agenda.Remove(addNode);
+-				
+-				if (scope.Contains(addNode) && head.Dominates(addNode) && result.Add(addNode)) {
+-					for (int i = 0; i < addNode.Outgoing.Count; i++) {
+-						agenda.Add(addNode.Outgoing[i].Target);
+-					}
+-				}
+-			}
+-			
+-			return result;
+-		}
+-		
+-		static HashSet<ControlFlowNode> FindLoopContent(HashSet<ControlFlowNode> scope, ControlFlowNode head)
+-		{
+-			HashSet<ControlFlowNode> agenda = new HashSet<ControlFlowNode>();
+-			for (int i = 0; i < head.Incoming.Count; i++) {
+-				var p = head.Incoming[i].Source;
+-				if (head.Dominates(p))
+-					agenda.Add(p);
+-			}
+-			HashSet<ControlFlowNode> result = new HashSet<ControlFlowNode>();
+-			
+-			while(agenda.Count > 0) {
+-				ControlFlowNode addNode = agenda.First();
+-				agenda.Remove(addNode);
+-				
+-				if (scope.Contains(addNode) && head.Dominates(addNode) && result.Add(addNode)) {
+-					for (int i = 0; i < addNode.Incoming.Count; i++)
+-						agenda.Add(addNode.Incoming[i].Source);
+-				}
+-			}
+-			if (scope.Contains(head))
+-				result.Add(head);
+-			
+-			return result;
+-		}
+-	}
++namespace ICSharpCode.Decompiler.ILAst
++{
++    /// <summary>
++    /// Description of LoopsAndConditions.
++    /// </summary>
++    public class LoopsAndConditions
++    {
++        readonly Dictionary<ILLabel, ControlFlowNode> labelToCfNode = new Dictionary<ILLabel, ControlFlowNode>();
++
++        DecompilerContext context;
++
++        uint nextLabelIndex;
++
++        public LoopsAndConditions(DecompilerContext context)
++        {
++            Initialize(context);
++        }
++
++        public void Initialize(DecompilerContext context)
++        {
++            this.context = context;
++            this.labelToCfNode.Clear();
++            this.nextLabelIndex = 0;
++        }
++
++        public void FindLoops(ILBlock block)
++        {
++            if (block.Body.Count > 0)
++            {
++                ControlFlowGraph graph;
++                graph = BuildGraph(block.Body, (ILLabel)block.EntryGoto.Operand);
++                graph.ComputeDominance(context.CancellationToken);
++                graph.ComputeDominanceFrontier();
++                //TODO: Keep BinSpans when writing to Body
++                block.Body = FindLoops(new HashSet<ControlFlowNode>(graph.Nodes.Skip(3)), graph.EntryPoint, false);
++            }
++        }
++
++        public void FindConditions(ILBlock block)
++        {
++            if (block.Body.Count > 0)
++            {
++                ControlFlowGraph graph;
++                graph = BuildGraph(block.Body, (ILLabel)block.EntryGoto.Operand);
++                graph.ComputeDominance(context.CancellationToken);
++                graph.ComputeDominanceFrontier();
++                //TODO: Keep BinSpans when writing to Body
++                block.Body = FindConditions(new HashSet<ControlFlowNode>(graph.Nodes.Skip(3)), graph.EntryPoint);
++            }
++        }
++
++        public bool Fixup(ILBlock method, ILBlock block)
++        {
++            var modified = false;
++
++            if (block.Body.Count > 0)
++            {
++                ControlFlowGraph graph;
++                graph = BuildGraph(block.Body, (ILLabel)block.EntryGoto.Operand);
++                graph.ComputeDominance(context.CancellationToken);
++                graph.ComputeDominanceFrontier();
++                //TODO: Keep BinSpans when writing to Body
++
++                var newbody = new List<ILNode>();
++                foreach (var node in graph.Nodes.Skip(3))
++                {
++                    if (node.Incoming.Count > 0)
++                    {
++                        var bb = node.UserData as ILBasicBlock;
++
++                        if (bb.Body.Count >= 3 && bb.Body[bb.Body.Count - 2].Match(ILCode.Brtrue))
++                        {
++                            var bexp = (bb.Body[bb.Body.Count - 2] as ILExpression);
++                            var target = bexp.Operand as ILLabel;
++
++                            if (bexp.Arguments[0].Match(ILCode.Ldloc) || (bexp.Arguments[0].Match(ILCode.LogicNot) && bexp.Arguments[0].Arguments[0].Match(ILCode.Ldloc)) )
++                            {
++                                ILVariable loc;
++                                if (bexp.Arguments[0].Match(ILCode.Ldloc))
++                                    loc = bexp.Arguments[0].Operand as ILVariable;
++                                else
++                                    loc = bexp.Arguments[0].Arguments[0].Operand as ILVariable;
++
++                                if (loc != null)
++                                {
++                                    ILVariable oloc;
++                                    var uses = method.GetSelfAndChildrenRecursive<ILExpression>(e => (e.Match(ILCode.Stloc, out oloc) || e.Match(ILCode.Ldloc, out oloc)) && oloc == loc);
++
++                                    if (uses.Count == 1)
++                                    {
++                                        bb.Body.RemoveAt(bb.Body.Count - 1);
++                                        bb.Body.RemoveAt(bb.Body.Count - 1);
++                                        bb.Body.Add(new ILExpression(ILCode.Br, target));
++                                        modified = true;
++                                    }
++                                }
++                            }
++                        }
++
++                        newbody.Add(bb);
++                    }
++                    else { modified = true; }
++                }
++
++                block.Body = newbody;
++            }
++
++            return modified;
++        }
++
++        internal bool NeedsDeobf(ILBlock method, AutoPropertyProvider autoPropertyProvider)
++        {
++            var yrt = YieldReturnDecompiler.YieldReturnType(context, method);
++            if (yrt != null)
++            {
++                foreach (var m in MethodUtils.GetMethod_Dispose(yrt).Concat(MethodUtils.GetMethod_GetEnumerator(yrt).Concat(MethodUtils.GetMethod_get_Current(yrt).Concat(MethodUtils.GetMethod_MoveNext(yrt)))))
++                {
++                    if (m != null && m.HasBody)
++                    {
++                        ILBlock ilMethod = new ILBlock(CodeBracesRangeFlags.MethodBraces);
++
++                        var astBuilder = context.Cache.GetILAstBuilder();
++                        try
++                        {
++                            ilMethod.Body = astBuilder.Build(m, true, context);
++                        }
++                        finally
++                        {
++                            context.Cache.Return(astBuilder);
++                        }
++
++                        var optimizer = this.context.Cache.GetILAstOptimizer();
++                        try
++                        {
++                            optimizer.Optimize(context, ilMethod, autoPropertyProvider, ILAstOptimizationStep.PropertyAccessInstructions); // obviously we dont want to deobfuscate it when we test if it needs deobfuscation..
++                        }
++                        finally
++                        {
++                            this.context.Cache.Return(optimizer);
++                        }
++
++                        if (NeedsDeobfImpl(ilMethod))
++                            return true;
++                    }
++                }
++            }
++
++            return NeedsDeobfImpl(method);
++        }
++
++        private bool NeedsDeobfImpl(ILBlock method)
++        {
++            foreach (var block in method.GetSelfAndChildrenRecursive<ILBlock>())
++            {
++                var body = block.Body;
++                for (int i = 0; i < body.Count; i++)
++                {
++                    if (body[i].Match(ILCode.Switch) && i >= 2)
++                    {
++                        var swexp = body[i] as ILExpression;
++                        if (swexp.Arguments[0].Match(ILCode.Rem_Un))
++                        {
++                            var nexp = swexp.Arguments[0].Arguments[0];
++                            if (nexp.Operand == null) // switch without store
++                            {
++                                if (nexp.Match(ILCode.Xor))
++                                    return true;
++                            }
++
++                            if (body[i - 1].Match(ILCode.Stloc) && body[i - 2].Match(ILCode.Stloc))
++                            {
++                                if ((body[i - 2] as ILExpression).Arguments[0].Match(ILCode.Xor) && (body[i - 2] as ILExpression).Operand == nexp.Operand)
++                                    return true;
++                            }
++                                
++                        }
++                    }
++                }
++            }
++
++            return false;
++        }
++
++        public void Deobf(ILBlock block)
++        {
++            if (block.Body.Count > 0)
++            {
++                var nums = new HashSet<ILVariable>(); // locals
++                var args = new HashSet<ILVariable>(); // generated stack variables
++
++                // cfo switches with stloc
++                // FIXME: context.CurrentMethod.Body.Variables isnt accurate after yield return transformation!
++                //foreach (var num_candidate in context.CurrentMethod.Body.Variables.Where(v => v.Type.FullName == "System.UInt32" && string.IsNullOrEmpty(v.Name))) // "num" candidate
++                {
++                    // consideration: does this GetSelfAndChildrenRecursive get things not in scope? the whole scope thing still seems a little magical.
++                    foreach (var the_switch in block.GetSelfAndChildrenRecursive<ILExpression>(e => e.Match(ILCode.Switch) && e.Arguments[0].Match(ILCode.Rem_Un)
++                                            && e.Arguments[0].Arguments[0].Match(ILCode.Stloc) && e.Arguments[0].Arguments[0].Operand is ILVariable)) // && (e.Arguments[0].Arguments[0].Operand as ILVariable).OriginalVariable == num_candidate))
++                    {
++                        var num_ilvar = the_switch.Arguments[0].Arguments[0].Operand as ILVariable;
++
++                        // catch: with more than one switch, these get "split" by a previous step (SplitVariables). thus we check .OriginalVariable
++                        // I believe this is what I need to do everywhere. Basically what this means is that it uses the same variable, but it gets re-initialized
++                        // you can see it in the generated c#, the thing is re-declared in every (c#) block
++                        // in IL, I cannot see it being zeroed implicitly, but it can just get assigned over.
++                        // since I'm eliminating them anyways, I probably dont need to take too much care, except to possibly remove all of its spawns from the locals if necessary
++                        // i reflect this by initializing all of these as 0, which should work as expected.
++                        if (nums.Any() && nums.First().OriginalVariable != num_ilvar.OriginalVariable) // there can be only one!
++                        {
++                            System.Diagnostics.Debugger.Break();
++                            return;
++                        }
++
++                        nums.Add(num_ilvar);
++
++                        var switch_reads = the_switch.GetSelfAndChildrenRecursive<ILExpression>(e => e.Match(ILCode.Xor) && e.Arguments[0].Operand is ILVariable && (e.Arguments[0].Operand as ILVariable).GeneratedByDecompiler && (e.Arguments[0].Operand as ILVariable).Type.FullName == "System.Int32");
++                        if (switch_reads.Count == 1)
++                        {
++                            var arg = switch_reads.Single().Arguments[0].Operand as ILVariable;
++                            args.Add(arg);
++                        }
++                    }
++                }
++
++                // cfo switches without stloc
++                // switch([labels..], rem.un:int32(xor:int32(arg_1A_0:int32, ldc.i4:int32(1931050559)), ldc.i4:int32(4)))
++                foreach (var the_switch in block.GetSelfAndChildrenRecursive<ILExpression>(e => e.Match(ILCode.Switch) && e.Arguments[0].Match(ILCode.Rem_Un) && e.Arguments[0].Arguments[0].Match(ILCode.Xor) &&
++                                        e.Arguments[0].Arguments[0].Arguments[0].Operand is ILVariable))
++                {
++                    var arg = the_switch.Arguments[0].Arguments[0].Arguments[0].Operand as ILVariable;
++                    System.Diagnostics.Debug.Assert(arg.GeneratedByDecompiler); // this has to be a stack variable, otherwise it would be the other form of switch
++
++                    args.Add(arg);
++                }
++
++                if (nums.Any() || args.Any())
++                {
++                    ControlFlowGraph graph;
++                    graph = BuildGraph(block.Body, (ILLabel)block.EntryGoto.Operand);
++                    graph.ComputeDominance(context.CancellationToken);
++                    graph.ComputeDominanceFrontier();
++
++                    var states = new VarStates();
++                    foreach (var v in nums.Concat(args).Distinct())
++                        states[v] = 0;
++
++                    //TODO: Keep BinSpans when writing to Body
++                    block.Body = Deobf(new HashSet<ControlFlowNode>(graph.Nodes.Skip(3)), graph.EntryPoint, false, states);
++                }
++            }
++        }
++
++        bool EvalSwitch(VarStates states, ILExpression switch_statement, ILLabel[] caseLabels, ILLabel fallLabel, out ControlFlowNode target, out ILLabel target_label, out VarStates effect)
++        {
++            var eval = EvalExp(switch_statement, states);
++            if (eval.Success)
++            {
++                effect = eval.Effect;
++                if (eval.Value < caseLabels.Length)
++                    target_label = caseLabels[eval.Value];
++                else
++                    target_label = fallLabel;
++
++                // this used to happen with old yield return decompilation
++                if (!labelToCfNode.ContainsKey(target_label))
++                    System.Diagnostics.Debugger.Break();
++
++                target = labelToCfNode[target_label];
++                return true;
++            }
++
++            target_label = null;
++            target = null;
++            effect = null;
++            return false;
++        }
++
++        // using our trace, we remove unreachable BBs and re-write BBs that branch to a cfo switch to either br to their single, direct decendent or to brtrue br to the two outcomes of their tern.
++        List<ILNode> Deobf(HashSet<ControlFlowNode> scope, ControlFlowNode entryPoint, bool excludeEntryPoint, VarStates states)
++        {
++            HashSet<ControlFlowNode> cf_switches;
++            DefaultDictionary<ControlFlowNode, HashSet<ILNode>> extra_sw_code;
++            var trace = DeobfTrace(scope, entryPoint, states, out cf_switches, out extra_sw_code);
++
++            var nodes_hit = trace.Select(t => t.dst).Distinct();
++
++            var new_bbs = new List<ILNode>();
++            foreach (var node in nodes_hit)
++            {
++                var bb = node.UserData as ILBasicBlock;
++
++                if (node.Outgoing.Count == 1 && cf_switches.Contains(node.Outgoing.Single().Target))
++                {
++                    var real_targets = trace.Where(tn => tn.src == node);
++                    var tcnt = real_targets.Count();
++
++                    // not currently observed
++                    var extra_code = extra_sw_code[node.Outgoing.Single().Target];
++
++                    // 0 or more than 2 targets breaks our assumption
++                    if (tcnt != 1 && tcnt != 2)
++                        System.Diagnostics.Debugger.Break();
++
++                    bb.Body.RemoveAt(bb.Body.Count - 1);
++
++                    bb.Body.AddRange(extra_code);
++
++                    if (tcnt == 1)
++                    {
++                        var dbb = real_targets.Single().dst.UserData as ILBasicBlock;
++
++                        bb.Body.Add(new ILExpression(ILCode.Br, dbb.Body.First()));
++                    }
++                    else if (tcnt == 2)
++                    {
++                        if (real_targets.First().last_tern == real_targets.Last().last_tern)
++                            System.Diagnostics.Debugger.Break();
++
++                        TraceNode truenode, falsenode;
++
++                        truenode = real_targets.Single(tn => tn.last_tern == true);
++                        falsenode = real_targets.Single(tn => tn.last_tern == false);
++
++                        var ternexp = bb.GetSelfAndChildrenRecursive<ILExpression>(e => e.Match(ILCode.TernaryOp)).Single().Arguments[0];
++
++                        bb.Body.Add(new ILExpression(ILCode.Brtrue, (truenode.dst.UserData as ILBasicBlock).Body.First(), ternexp));
++                        bb.Body.Add(new ILExpression(ILCode.Br, (falsenode.dst.UserData as ILBasicBlock).Body.First()));
++                    }
++                }
++
++                // remove CFO variable shenans
++                for (int i = bb.Body.Count - 1; i >= 0; i--)
++                {
++                    if (EvalExp(bb.Body[i], states, true).Success)
++                        bb.Body.RemoveAt(i);
++                }
++
++                new_bbs.Add(bb);
++            }
++
++            return new_bbs;
++        }
++
++        // generate a trace that represents all possible control flow. while building this we use our VarState simulation.
++        // we remove the cfo switches from our flow graph, and flatten the resulting edge collection
++        List<TraceNode> DeobfTrace(HashSet<ControlFlowNode> scope, ControlFlowNode entryPoint, VarStates states, out HashSet<ControlFlowNode> cf_switches, out DefaultDictionary<ControlFlowNode, HashSet<ILNode>> extra_sw_code)
++        {
++            var agenda = new Queue<TraceNode>();
++            var visited = new List<TraceNode>();
++
++            cf_switches = new HashSet<ControlFlowNode>();
++            extra_sw_code = new DefaultDictionary<ControlFlowNode, HashSet<ILNode>>(_ => new HashSet<ILNode>());
++
++            agenda.Enqueue(new TraceNode(entryPoint, entryPoint.Outgoing.Single().Target, states));
++            while (agenda.Count > 0)
++            {
++                var aitem = agenda.Dequeue();
++                var node = aitem.dst;
++
++                if (visited.Contains(aitem))
++                {
++                    foreach (var prev in aitem.prevs)
++                    {
++                        visited.Single(i => i.Equals(aitem)).prevs.Add(prev); // looks dumb but is correct?
++                    }
++
++                    continue;
++                }
++
++                visited.Add(aitem);
++
++                var bb = node.UserData as ILBasicBlock;
++
++                // if cfo switch, find and add target
++                ILLabel[] caseLabels;
++                ILExpression switchArg;
++                ILLabel fallLabel;
++                if(bb.MatchLastAndBr(ILCode.Switch, out caseLabels, out switchArg, out fallLabel))
++                {
++                    ControlFlowNode target;
++                    ILLabel target_label;
++                    VarStates sw_effect;
++                    if (EvalSwitch(aitem.states, switchArg, caseLabels, fallLabel, out target, out target_label, out sw_effect))
++                    {
++                        cf_switches.Add(node);
++
++                        // this does not actually happen, I mistakenly thought it did. either way, I'll leave this here just so it's handled
++                        if (bb.Body.Count > 3) // [label:] <stuff> [switch()] [br]
++                        {
++                            System.Diagnostics.Debug.WriteLine("CFO SWITCH WITH MORE THAN 3 INSTRUCTIONS: " + this.context.CurrentMethod.FullName.ToString());
++                            for (int i = 1; i < bb.Body.Count - 2; i++)
++                            {
++                                extra_sw_code[node].Add(bb.Body[i]);
++                                System.Diagnostics.Debug.WriteLine("INSTRUCTION " + i + ": " + bb.Body[i].ToString());
++                            }
++                        }
++
++                        agenda.Enqueue(new TraceNode(node, target, sw_effect, aitem));
++
++                        continue;
++                    }
++
++                    // else we have non-cfo switch, treat as normal cf
++                }
++
++                // do cf sim
++                var working_state = new VarStates(aitem.states);
++                var cf_handled = false;
++                foreach (var inst in bb.Body)
++                {
++                    // if complicated (trycatch), deobf is out of scope and done as part of a seperate block
++                    if (inst is ILTryCatchBlock)
++                        break;
++
++                    var terns = inst.GetSelfAndChildrenRecursive<ILExpression>(e => e.Match(ILCode.TernaryOp));
++
++                    if (terns.Any())
++                    {
++                        var tern_cond = terns.Single().Arguments[0];
++
++                        var tern_true_res = EvalExp(inst, working_state, true);
++                        var tern_false_res = EvalExp(inst, working_state, false);
++
++                        // if cfo tern, add two items to agenda and ignore rest of body
++                        if (tern_true_res.Success && tern_false_res.Success)
++                        {
++                            agenda.Enqueue(new TraceNode(node, node.Outgoing.Single().Target, tern_true_res.Effect, aitem) { last_tern = true } );
++                            agenda.Enqueue(new TraceNode(node, node.Outgoing.Single().Target, tern_false_res.Effect, aitem));
++                            cf_handled = true;
++
++                            // TODO: if there were more CFO instructions after the tern, i would need to not break here and continue all further CF sim on both tern_true_res and tern_false_res
++                            break;
++                        }
++                    }
++
++                    var eval = EvalExp(inst, working_state);
++                    if (eval.Success)
++                        working_state = eval.Effect;
++                }
++
++                // if normal control flow, add outgoing edges
++                if (!cf_handled)
++                    foreach (var og in node.Outgoing)
++                        agenda.Enqueue(new TraceNode(node, og.Target, working_state, aitem));
++            }
++
++            // remove all nodes that come from switch and connect them directly
++            var result = new List<TraceNode>();
++            for (int i = 0; i < visited.Count; i++)
++            {
++                var node = visited[i];
++
++                if (cf_switches.Contains(node.src)) // node: switch -> code2
++                {
++                    foreach (var prev in node.prevs) // prev: code1 -> switch
++                    {
++                        result.Add(new TraceNode(prev.src, node.dst, node.states) { last_tern = prev.last_tern });
++                    }
++                }
++                else if (!cf_switches.Contains(node.dst)) // don't add the other part of the two nodes we replaced with one
++                {
++                    result.Add(node);
++                }
++            }
++
++            // there may now be duplicate edges that were previously masked by the switch!
++            // cfo variable states are no longer relevant for equality
++            result = result.Distinct(new TraceNode.StatelessEqualityComparer()).ToList();
++
++            return result;
++        }
++
++        // misnomer: is more of an edge, really
++        private class TraceNode
++        {
++            public class StatelessEqualityComparer : EqualityComparer<TraceNode>
++            {
++                public override bool Equals(TraceNode x, TraceNode y)
++                {
++                    return x.src == y.src && x.dst == y.dst && x.last_tern == y.last_tern;
++                }
++
++                public override int GetHashCode(TraceNode obj)
++                {
++                    return obj.src.BlockIndex ^ (obj.dst.BlockIndex << 8) ^ (obj.last_tern ? 1 : 0);
++                }
++            }
++
++            public TraceNode(ControlFlowNode s, ControlFlowNode d, VarStates st, TraceNode p = null)
++            {
++                src = s; dst = d;
++                states = new VarStates(st);
++
++                if (p != null)
++                    prevs.Add(p);
++            }
++
++            // somewhat whacky predecessor tracking but it does the job
++            public HashSet<TraceNode> prevs = new HashSet<TraceNode>();
++
++            public ControlFlowNode src, dst;
++            public VarStates states;
++            public bool last_tern;
++
++            public override int GetHashCode()
++            {
++                return states.GetHashCode() ^ src.BlockIndex ^ (dst.BlockIndex << 8) ^ (last_tern ? 1 : 0);
++            }
++
++            public override bool Equals(object obj)
++            {
++                var other = obj as TraceNode;
++                if (other == null)
++                    return false;
++
++                if(src != other.src || dst != other.dst || last_tern != other.last_tern || !other.states.Equals(states))
++                    return false;
++
++                return true;
++            }
++        }
++
++        private EvalResult EvalExp(object expression, VarStates states, bool? tern_solution = null)
++        {
++            var result = new EvalResult(states) { Success = false };
++            unchecked
++            {
++                if (expression is int)
++                {
++                    result.Success = true;
++                    result.Value = (int)expression;
++                    return result;
++                }
++                if (expression is ILVariable)
++                {
++                    if (!states.Vars.ContainsKey(expression as ILVariable))
++                        return result;
++
++                    result.Success = true;
++                    result.Value = states[expression as ILVariable];
++                    return result;
++                }
++                if (!(expression is ILExpression))
++                    return result;
++
++                var exp = expression as ILExpression;
++
++                if (exp.Arguments.Count == 2 && exp.Operand == null)
++                {
++                    var left = EvalExp(exp.Arguments[0], states, tern_solution);
++                    if (!left.Success)
++                        return result;
++                    var right = EvalExp(exp.Arguments[1], left.Effect, tern_solution);
++
++                    if (result.Success = right.Success)
++                    {
++                        result.Effect = right.Effect;
++                        switch(exp.Code)
++                        {
++                            case ILCode.Xor:
++                                result.Value = left.Value ^ right.Value;
++                                break;
++
++                            case ILCode.Rem_Un:
++                                result.Value = left.Value % right.Value;
++                                break;
++
++                            case ILCode.Mul:
++                                result.Value = left.Value * right.Value;
++                                break;
++
++                            default:
++                                result.Effect = null;
++                                result.Success = false;
++                                break;
++                        }
++                    }
++
++                    return result;
++                }
++
++                switch (exp.Code)
++                {
++                    case ILCode.TernaryOp:
++                        if (tern_solution == null || !tern_solution.HasValue)
++                            return result;
++
++                        var tern_result = EvalExp(tern_solution.Value ? exp.Arguments[1] : exp.Arguments[2], states); // currently, we intentionally dont forward the ternary solution so nested terns will fail
++                        if (tern_result.Success)
++                        {
++                            result = tern_result;
++                        }
++
++                        return result;
++
++                    case ILCode.Stloc:
++                        var operand = exp.Operand as ILVariable;
++
++                        if (!states.Vars.ContainsKey(operand))
++                            return result;
++
++                        var eval_arg = EvalExp(exp.Arguments.Single(), states, tern_solution);
++                        if (result.Success = eval_arg.Success)
++                        {
++                            result.Effect[operand] = eval_arg.Value;
++                            result.Value = eval_arg.Value;
++                        }
++                        return result;
++
++                    case ILCode.Ldloc:
++                    case ILCode.Ldc_I4:
++                        return EvalExp(exp.Operand, states, tern_solution);
++                }
++            }
++
++            return result;
++        }
++
++        private class VarStates
++        {
++            public VarStates()
++            {
++                Vars = new Dictionary<ILVariable, int>();
++            }
++
++            public VarStates(VarStates other)
++            {
++                Vars = new Dictionary<ILVariable, int>(other.Vars);
++            }
++
++            public Dictionary<ILVariable, int> Vars;
++            public int this[ILVariable key]
++            {
++                get
++                {
++                    return Vars[key];
++                }
++                set
++                {
++                    Vars[key] = value;
++                }
++            }
++
++            public override int GetHashCode()
++            {
++                return Vars.Values.Aggregate(0, (a, b) => a ^ b);
++            }
++
++            public override bool Equals(object obj)
++            {
++                var other = obj as VarStates;
++                if (other == null || other.Vars.Count != Vars.Count)
++                    return false;
++
++                foreach (var mine in Vars)
++                    if (!other.Vars.ContainsKey(mine.Key) || other.Vars[mine.Key] != mine.Value)
++                        return false;
++
++                return true;
++            }
++        }
++
++        private class EvalResult
++        {
++            public EvalResult() { }
++
++            public EvalResult(VarStates states)
++            {
++                Effect = new VarStates(states);
++            }
++
++            public bool Success;
++            public int Value;
++            public VarStates Effect;
++        }
++
++        readonly ControlFlowGraph cached_ControlFlowGraph = new ControlFlowGraph();
++        ControlFlowGraph BuildGraph(List<ILNode> nodes, ILLabel entryLabel)
++        {
++            cached_ControlFlowGraph.Nodes.Clear();
++            int index = 0;
++            var cfNodes = cached_ControlFlowGraph.Nodes;
++            ControlFlowNode entryPoint = new ControlFlowNode(index++, 0, ControlFlowNodeType.EntryPoint);
++            cfNodes.Add(entryPoint);
++            ControlFlowNode regularExit = new ControlFlowNode(index++, null, ControlFlowNodeType.RegularExit);
++            cfNodes.Add(regularExit);
++            ControlFlowNode exceptionalExit = new ControlFlowNode(index++, null, ControlFlowNodeType.ExceptionalExit);
++            cfNodes.Add(exceptionalExit);
++
++            // Create graph nodes
++            labelToCfNode.Clear();
++            Dictionary<ILNode, ControlFlowNode> astNodeToCfNode = new Dictionary<ILNode, ControlFlowNode>();
++            List<ILLabel> listLabels = null;
++            foreach (ILBasicBlock node in nodes)
++            {
++                ControlFlowNode cfNode = new ControlFlowNode(index++, null, ControlFlowNodeType.Normal);
++                cfNodes.Add(cfNode);
++                astNodeToCfNode[node] = cfNode;
++                cfNode.UserData = node;
++
++                // Find all contained labels
++                foreach (ILLabel label in node.GetSelfAndChildrenRecursive<ILLabel>(listLabels ?? (listLabels = new List<ILLabel>())))
++                {
++                    labelToCfNode[label] = cfNode;
++                }
++            }
++
++            // Entry endge
++            ControlFlowNode entryNode = labelToCfNode[entryLabel];
++            ControlFlowEdge entryEdge = new ControlFlowEdge(entryPoint, entryNode, JumpType.Normal);
++            entryPoint.Outgoing.Add(entryEdge);
++            entryNode.Incoming.Add(entryEdge);
++
++            // Create edges
++            List<ILExpression> listExpressions = null;
++            foreach (ILBasicBlock node in nodes)
++            {
++                ControlFlowNode source = astNodeToCfNode[node];
++
++                // Find all branches
++                foreach (ILLabel target in node.GetSelfAndChildrenRecursive<ILExpression>(listExpressions ?? (listExpressions = new List<ILExpression>()), e => e.IsBranch()).SelectMany(e => e.GetBranchTargets()))
++                {
++                    ControlFlowNode destination;
++                    // Labels which are out of out scope will not be in the collection
++                    // Insert self edge only if we are sure we are a loop
++                    if (labelToCfNode.TryGetValue(target, out destination) && (destination != source || target == node.Body.FirstOrDefault()))
++                    {
++                        ControlFlowEdge edge = new ControlFlowEdge(source, destination, JumpType.Normal);
++                        source.Outgoing.Add(edge);
++                        destination.Incoming.Add(edge);
++                    }
++                }
++            }
++
++            return cached_ControlFlowGraph;
++        }
++
++        List<ILNode> FindLoops(HashSet<ControlFlowNode> scope, ControlFlowNode entryPoint, bool excludeEntryPoint)
++        {
++            List<ILNode> result = new List<ILNode>();
++
++            // Do not modify entry data
++            scope = new HashSet<ControlFlowNode>(scope);
++
++            Queue<ControlFlowNode> agenda = new Queue<ControlFlowNode>();
++            agenda.Enqueue(entryPoint);
++            while (agenda.Count > 0)
++            {
++                ControlFlowNode node = agenda.Dequeue();
++
++                // If the node is a loop header
++                if (scope.Contains(node)
++                    && node.DominanceFrontier.Contains(node)
++                    && (node != entryPoint || !excludeEntryPoint))
++                {
++                    HashSet<ControlFlowNode> loopContents = FindLoopContent(scope, node);
++
++                    // If the first expression is a loop condition
++                    ILBasicBlock basicBlock = (ILBasicBlock)node.UserData;
++                    ILExpression condExpr;
++                    ILLabel trueLabel;
++                    ILLabel falseLabel;
++                    // It has to be just brtrue - any preceding code would introduce goto
++                    if (basicBlock.MatchSingleAndBr(ILCode.Brtrue, out trueLabel, out condExpr, out falseLabel))
++                    {
++                        ControlFlowNode trueTarget;
++                        labelToCfNode.TryGetValue(trueLabel, out trueTarget);
++                        ControlFlowNode falseTarget;
++                        labelToCfNode.TryGetValue(falseLabel, out falseTarget);
++
++                        // If one point inside the loop and the other outside
++                        if ((!loopContents.Contains(trueTarget) && loopContents.Contains(falseTarget)) ||
++                            (loopContents.Contains(trueTarget) && !loopContents.Contains(falseTarget)))
++                        {
++                            loopContents.RemoveOrThrow(node);
++                            scope.RemoveOrThrow(node);
++
++                            // If false means enter the loop
++                            if (loopContents.Contains(falseTarget) || falseTarget == node)
++                            {
++                                // Negate the condition
++                                condExpr = new ILExpression(ILCode.LogicNot, null, condExpr);
++                                ILLabel tmp = trueLabel;
++                                trueLabel = falseLabel;
++                                falseLabel = tmp;
++                            }
++
++                            ControlFlowNode postLoopTarget;
++                            labelToCfNode.TryGetValue(falseLabel, out postLoopTarget);
++                            if (postLoopTarget != null)
++                            {
++                                // Pull more nodes into the loop
++                                HashSet<ControlFlowNode> postLoopContents = FindDominatedNodes(scope, postLoopTarget);
++                                var pullIn = scope.Except(postLoopContents).Where(n => node.Dominates(n));
++                                loopContents.UnionWith(pullIn);
++                            }
++
++                            // Use loop to implement the brtrue
++                            var tail = basicBlock.Body.RemoveTail(ILCode.Brtrue, ILCode.Br);
++                            ILWhileLoop whileLoop;
++                            basicBlock.Body.Add(whileLoop = new ILWhileLoop()
++                            {
++                                Condition = condExpr,
++                                BodyBlock = new ILBlock(CodeBracesRangeFlags.LoopBraces)
++                                {
++                                    EntryGoto = new ILExpression(ILCode.Br, trueLabel),
++                                    Body = FindLoops(loopContents, node, false)
++                                }
++                            });
++                            if (context.CalculateBinSpans)
++                            {
++                                whileLoop.BinSpans.AddRange(tail[0].BinSpans);  // no recursive add
++                                tail[1].AddSelfAndChildrenRecursiveBinSpans(whileLoop.BinSpans);
++                            }
++                            basicBlock.Body.Add(new ILExpression(ILCode.Br, falseLabel));
++                            result.Add(basicBlock);
++
++                            scope.ExceptWith(loopContents);
++                        }
++                    }
++
++                    // Fallback method: while(true)
++                    if (scope.Contains(node))
++                    {
++                        result.Add(new ILBasicBlock()
++                        {
++                            Body = new List<ILNode>() {
++                                new ILLabel() { Name = "Loop_" + (nextLabelIndex++).ToString() },
++                                new ILWhileLoop() {
++                                    BodyBlock = new ILBlock(CodeBracesRangeFlags.LoopBraces) {
++                                        EntryGoto = new ILExpression(ILCode.Br, (ILLabel)basicBlock.Body.First()),
++                                        Body = FindLoops(loopContents, node, true)
++                                    }
++                                },
++                            },
++                        });
++
++                        scope.ExceptWith(loopContents);
++                    }
++                }
++
++                // Using the dominator tree should ensure we find the the widest loop first
++                foreach (var child in node.DominatorTreeChildren)
++                {
++                    agenda.Enqueue(child);
++                }
++            }
++
++            // Add whatever is left
++            foreach (var node in scope)
++            {
++                result.Add((ILNode)node.UserData);
++            }
++            scope.Clear();
++
++            return result;
++        }
++
++        List<ILNode> FindConditions(HashSet<ControlFlowNode> scope, ControlFlowNode entryNode)
++        {
++            List<ILNode> result = new List<ILNode>();
++
++            // Do not modify entry data
++            scope = new HashSet<ControlFlowNode>(scope);
++
++            Stack<ControlFlowNode> agenda = new Stack<ControlFlowNode>();
++            agenda.Push(entryNode);
++            while (agenda.Count > 0)
++            {
++                ControlFlowNode node = agenda.Pop();
++
++                // Find a block that represents a simple condition
++                if (scope.Contains(node))
++                {
++
++                    ILBasicBlock block = (ILBasicBlock)node.UserData;
++
++                    {
++                        // Switch
++                        ILLabel[] caseLabels;
++                        ILExpression switchArg;
++                        ILLabel fallLabel;
++                        if (block.MatchLastAndBr(ILCode.Switch, out caseLabels, out switchArg, out fallLabel))
++                        {
++
++                            // Replace the switch code with ILSwitch
++                            ILSwitch ilSwitch = new ILSwitch() { Condition = switchArg };
++                            var tail = block.Body.RemoveTail(ILCode.Switch, ILCode.Br);
++                            if (context.CalculateBinSpans)
++                            {
++                                ilSwitch.BinSpans.AddRange(tail[0].BinSpans);   // no recursive add
++                                tail[1].AddSelfAndChildrenRecursiveBinSpans(ilSwitch.BinSpans);
++                            }
++                            block.Body.Add(ilSwitch);
++                            block.Body.Add(new ILExpression(ILCode.Br, fallLabel));
++                            result.Add(block);
++
++                            // Remove the item so that it is not picked up as content
++                            scope.RemoveOrThrow(node);
++
++                            // Find the switch offset
++                            int addValue = 0;
++                            List<ILExpression> subArgs;
++                            if (ilSwitch.Condition.Match(ILCode.Sub, out subArgs) && subArgs[1].Match(ILCode.Ldc_I4, out addValue))
++                            {
++                                var old = ilSwitch.Condition;
++                                ilSwitch.Condition = subArgs[0];
++                                if (context.CalculateBinSpans)
++                                {
++                                    ilSwitch.Condition.BinSpans.AddRange(old.BinSpans); // no recursive add
++                                    for (int i = 1; i < subArgs.Count; i++)
++                                        subArgs[i].AddSelfAndChildrenRecursiveBinSpans(ilSwitch.Condition.BinSpans);
++                                }
++                            }
++
++                            // Pull in code of cases
++                            ControlFlowNode fallTarget = null;
++                            labelToCfNode.TryGetValue(fallLabel, out fallTarget);
++
++                            HashSet<ControlFlowNode> frontiers = new HashSet<ControlFlowNode>();
++                            if (fallTarget != null)
++                                frontiers.UnionWith(fallTarget.DominanceFrontier.Except(new[] { fallTarget }));
++
++                            foreach (ILLabel condLabel in caseLabels)
++                            {
++                                ControlFlowNode condTarget;
++                                labelToCfNode.TryGetValue(condLabel, out condTarget);
++                                if (condTarget != null)
++                                    frontiers.UnionWith(condTarget.DominanceFrontier.Except(new[] { condTarget }));
++                            }
++
++                            bool includedDefault = false;
++                            for (int i = 0; i < caseLabels.Length; i++)
++                            {
++                                ILLabel condLabel = caseLabels[i];
++
++                                // Find or create new case block
++                                ILSwitch.CaseBlock caseBlock = ilSwitch.CaseBlocks.FirstOrDefault(b => b.EntryGoto.Operand == condLabel);
++                                if (caseBlock == null)
++                                {
++                                    caseBlock = new ILSwitch.CaseBlock()
++                                    {
++                                        Values = new List<int>(),
++                                        EntryGoto = new ILExpression(ILCode.Br, condLabel)
++                                    };
++                                    ilSwitch.CaseBlocks.Add(caseBlock);
++                                    if (!includedDefault && condLabel == fallLabel)
++                                    {
++                                        includedDefault = true;
++                                        block.Body.RemoveTail(ILCode.Br);
++                                        caseBlock.Values = null;
++                                    }
++
++                                    ControlFlowNode condTarget = null;
++                                    labelToCfNode.TryGetValue(condLabel, out condTarget);
++                                    if (condTarget != null && !frontiers.Contains(condTarget))
++                                    {
++                                        HashSet<ControlFlowNode> content = FindDominatedNodes(scope, condTarget);
++                                        scope.ExceptWith(content);
++                                        caseBlock.Body.AddRange(FindConditions(content, condTarget));
++                                        // Add explicit break which should not be used by default, but the goto removal might decide to use it
++                                        caseBlock.Body.Add(new ILBasicBlock()
++                                        {
++                                            Body = {
++                                                new ILLabel() { Name = "SwitchBreak_" + (nextLabelIndex++).ToString() },
++                                                new ILExpression(ILCode.LoopOrSwitchBreak, null)
++                                            }
++                                        });
++                                    }
++                                }
++                                caseBlock.Values?.Add(i + addValue);
++                            }
++
++                            // Heuristis to determine if we want to use fallthough as default case
++                            if (!includedDefault && fallTarget != null && !frontiers.Contains(fallTarget))
++                            {
++                                HashSet<ControlFlowNode> content = FindDominatedNodes(scope, fallTarget);
++                                if (content.Any())
++                                {
++                                    var caseBlock = new ILSwitch.CaseBlock() { EntryGoto = new ILExpression(ILCode.Br, fallLabel) };
++                                    ilSwitch.CaseBlocks.Add(caseBlock);
++                                    tail = block.Body.RemoveTail(ILCode.Br);
++                                    if (context.CalculateBinSpans)
++                                        tail[0].AddSelfAndChildrenRecursiveBinSpans(caseBlock.BinSpans);
++
++                                    scope.ExceptWith(content);
++                                    caseBlock.Body.AddRange(FindConditions(content, fallTarget));
++                                    // Add explicit break which should not be used by default, but the goto removal might decide to use it
++                                    caseBlock.Body.Add(new ILBasicBlock()
++                                    {
++                                        Body = {
++                                            new ILLabel() { Name = "SwitchBreak_" + (nextLabelIndex++).ToString() },
++                                            new ILExpression(ILCode.LoopOrSwitchBreak, null)
++                                        }
++                                    });
++                                }
++                            }
++                        }
++
++                        // Two-way branch
++                        ILExpression condExpr;
++                        ILLabel trueLabel;
++                        ILLabel falseLabel;
++                        if (block.MatchLastAndBr(ILCode.Brtrue, out trueLabel, out condExpr, out falseLabel))
++                        {
++
++                            // Swap bodies since that seems to be the usual C# order
++                            ILLabel temp = trueLabel;
++                            trueLabel = falseLabel;
++                            falseLabel = temp;
++                            condExpr = new ILExpression(ILCode.LogicNot, null, condExpr);
++
++                            // Convert the brtrue to ILCondition
++                            ILCondition ilCond = new ILCondition()
++                            {
++                                Condition = condExpr,
++                                TrueBlock = new ILBlock(CodeBracesRangeFlags.ConditionalBraces) { EntryGoto = new ILExpression(ILCode.Br, trueLabel) },
++                                FalseBlock = new ILBlock(CodeBracesRangeFlags.ConditionalBraces) { EntryGoto = new ILExpression(ILCode.Br, falseLabel) }
++                            };
++                            var tail = block.Body.RemoveTail(ILCode.Brtrue, ILCode.Br);
++                            if (context.CalculateBinSpans)
++                            {
++                                condExpr.BinSpans.AddRange(tail[0].BinSpans);   // no recursive add
++                                tail[1].AddSelfAndChildrenRecursiveBinSpans(ilCond.FalseBlock.BinSpans);
++                            }
++                            block.Body.Add(ilCond);
++                            result.Add(block);
++
++                            // Remove the item immediately so that it is not picked up as content
++                            scope.RemoveOrThrow(node);
++
++                            ControlFlowNode trueTarget = null;
++                            labelToCfNode.TryGetValue(trueLabel, out trueTarget);
++                            ControlFlowNode falseTarget = null;
++                            labelToCfNode.TryGetValue(falseLabel, out falseTarget);
++
++                            // Pull in the conditional code
++                            if (trueTarget != null && HasSingleEdgeEnteringBlock(trueTarget))
++                            {
++                                HashSet<ControlFlowNode> content = FindDominatedNodes(scope, trueTarget);
++                                scope.ExceptWith(content);
++                                ilCond.TrueBlock.Body.AddRange(FindConditions(content, trueTarget));
++                            }
++                            if (falseTarget != null && HasSingleEdgeEnteringBlock(falseTarget))
++                            {
++                                HashSet<ControlFlowNode> content = FindDominatedNodes(scope, falseTarget);
++                                scope.ExceptWith(content);
++                                ilCond.FalseBlock.Body.AddRange(FindConditions(content, falseTarget));
++                            }
++                        }
++                    }
++
++                    // Add the node now so that we have good ordering
++                    if (scope.Contains(node))
++                    {
++                        result.Add((ILNode)node.UserData);
++                        scope.Remove(node);
++                    }
++                }
++
++                // depth-first traversal of dominator tree
++                for (int i = node.DominatorTreeChildren.Count - 1; i >= 0; i--)
++                {
++                    agenda.Push(node.DominatorTreeChildren[i]);
++                }
++            }
++
++            // Add whatever is left
++            foreach (var node in scope)
++            {
++                result.Add((ILNode)node.UserData);
++            }
++
++            return result;
++        }
++
++        static bool HasSingleEdgeEnteringBlock(ControlFlowNode node)
++        {
++            return node.Incoming.Count(edge => !node.Dominates(edge.Source)) == 1;
++        }
++
++        static HashSet<ControlFlowNode> FindDominatedNodes(HashSet<ControlFlowNode> scope, ControlFlowNode head)
++        {
++            HashSet<ControlFlowNode> agenda = new HashSet<ControlFlowNode>();
++            HashSet<ControlFlowNode> result = new HashSet<ControlFlowNode>();
++            agenda.Add(head);
++
++            while (agenda.Count > 0)
++            {
++                ControlFlowNode addNode = agenda.First();
++                agenda.Remove(addNode);
++
++                if (scope.Contains(addNode) && head.Dominates(addNode) && result.Add(addNode))
++                {
++                    for (int i = 0; i < addNode.Outgoing.Count; i++)
++                    {
++                        agenda.Add(addNode.Outgoing[i].Target);
++                    }
++                }
++            }
++
++            return result;
++        }
++
++        static HashSet<ControlFlowNode> FindLoopContent(HashSet<ControlFlowNode> scope, ControlFlowNode head)
++        {
++            HashSet<ControlFlowNode> agenda = new HashSet<ControlFlowNode>();
++            for (int i = 0; i < head.Incoming.Count; i++)
++            {
++                var p = head.Incoming[i].Source;
++                if (head.Dominates(p))
++                    agenda.Add(p);
++            }
++            HashSet<ControlFlowNode> result = new HashSet<ControlFlowNode>();
++
++            while (agenda.Count > 0)
++            {
++                ControlFlowNode addNode = agenda.First();
++                agenda.Remove(addNode);
++
++                if (scope.Contains(addNode) && head.Dominates(addNode) && result.Add(addNode))
++                {
++                    for (int i = 0; i < addNode.Incoming.Count; i++)
++                        agenda.Add(addNode.Incoming[i].Source);
++                }
++            }
++            if (scope.Contains(head))
++                result.Add(head);
++
++            return result;
++        }
++    }
+ }
+diff --git a/ICSharpCode.Decompiler/ILAst/MonoYieldReturnDecompiler.cs b/ICSharpCode.Decompiler/ILAst/MonoYieldReturnDecompiler.cs
+index 93cb81d..567fa7f 100644
+--- a/ICSharpCode.Decompiler/ILAst/MonoYieldReturnDecompiler.cs
++++ b/ICSharpCode.Decompiler/ILAst/MonoYieldReturnDecompiler.cs
+@@ -34,6 +34,7 @@ sealed class MonoYieldReturnDecompiler : YieldReturnDecompiler {
+ 			var yrd = new MonoYieldReturnDecompiler(context, autoPropertyProvider);
+ 			if (!yrd.MatchEnumeratorCreationPattern(method))
+ 				return null;
++
+ 			yrd.enumeratorType = yrd.enumeratorCtor.DeclaringType;
+ 			return yrd;
+ 		}
+@@ -49,8 +50,12 @@ sealed class MonoYieldReturnDecompiler : YieldReturnDecompiler {
+ 
+ 			int i = 0;
+ 
+-			// Check if it could be an IEnumerator method with just a yield break in it
+-			if (body.Count == 1) {
++            // super sketchy, but if the enumerator creation is actually long it does get obfuscated and we have some relict branches that havent been removed yet..
++            if (body.Count >= 1 && body.First() is ILBasicBlock)
++                body = body.Cast<ILBasicBlock>().SelectMany(n => n.Body.Where(nn => !(nn is ILLabel) && !(nn.Match(ILCode.Br)))).ToList();
++
++            // Check if it could be an IEnumerator method with just a yield break in it
++            if (body.Count == 1) {
+ 				if (!body[i].Match(ILCode.Ret, out newobj))
+ 					return false;
+ 				enumVar = null;
+@@ -68,11 +73,11 @@ sealed class MonoYieldReturnDecompiler : YieldReturnDecompiler {
+ 			if (!IsCompilerGeneratorEnumerator(enumeratorCtor.DeclaringType))
+ 				return false;
+ 
+-			if (method.Body.Count == 1)
++			if (body.Count == 1)
+ 				return true;
+ 
+ 			i++;
+-			if (!InitializeFieldToParameterMap(method, enumVar, ref i))
++			if (!InitializeFieldToParameterMap(body, enumVar, ref i, body.Count))
+ 				return false;
+ 
+ 			ILExpression ldloc;
+@@ -108,7 +113,14 @@ sealed class MonoYieldReturnDecompiler : YieldReturnDecompiler {
+ 		protected override void AnalyzeCtor() {
+ 			ILBlock method = CreateILAst(enumeratorCtor);
+ 			var body = method.Body;
+-			if (body.Count != 2)
++
++            if (body.Count < 1)
++                throw new SymbolicAnalysisFailedException();
++
++            if (body[0] is ILBasicBlock)
++                body = (body[0] as ILBasicBlock).Body.SkipWhile(n => n is ILLabel).ToList();
++
++            if (body.Count != 2)
+ 				throw new SymbolicAnalysisFailedException();
+ 			IMethod m;
+ 			ILExpression ldthis;
+@@ -123,6 +135,8 @@ sealed class MonoYieldReturnDecompiler : YieldReturnDecompiler {
+ 		}
+ 
+ 		void InitializeDisposeMethod(ILBlock method) {
++            method.Body = DeBB(method);
++
+ 			FieldDef localStateField = null;
+ 			foreach (var n in method.Body) {
+ 				var expr = n as ILExpression;
+@@ -178,15 +192,20 @@ sealed class MonoYieldReturnDecompiler : YieldReturnDecompiler {
+ 		protected override void AnalyzeMoveNext() {
+ 			var moveNextMethod = MethodUtils.GetMethod_MoveNext(enumeratorType).FirstOrDefault();
+ 			var ilMethod = CreateILAst(moveNextMethod);
+-			var body = ilMethod.Body;
++
++			var body = DeBB(ilMethod);
+ 			if (body.Count == 0)
+ 				throw new SymbolicAnalysisFailedException();
+ 
+ 			// If it's an IEnumerator method with just a yield break in it, we haven't found the state field yet
+ 			if (stateField == null) {
+-				const int index = 1;
++				int index = 1;
+ 				IField f;
+ 				List<ILExpression> args;
++
++                while (index < body.Count && body[index] is ILLabel)
++                    index++;
++
+ 				if (index + 1 >= body.Count || !body[index].Match(ILCode.Stfld, out f, out args) || args.Count != 2 || !args[0].MatchThis() || !args[1].MatchLdcI4(-1))
+ 					throw new SymbolicAnalysisFailedException();
+ 				var field = GetFieldDefinition(f);
+@@ -197,68 +216,148 @@ sealed class MonoYieldReturnDecompiler : YieldReturnDecompiler {
+ 
+ 			disposeInFinallyVar = MonoStateMachineUtils.FindDisposeLocal(ilMethod);
+ 
+-			int bodyLength;
+-			if (!FindReturnLabels(body, out bodyLength, out returnFalseLabel, out returnTrueLabel))
++            List<ILNode> strippedbody;
++            int bodyLength;
++            bool labelsfound;
++
++            if (ilMethod.Body != body) // if BB shenanigans happened
++            {
++                labelsfound = FindReturnLabelsBB(ilMethod.Body, out returnFalseLabel, out returnTrueLabel, out strippedbody);
++                bodyLength = strippedbody.Count;
++            }
++            else
++            {
++                labelsfound = FindReturnLabels(body, out bodyLength, out returnFalseLabel, out returnTrueLabel);
++                strippedbody = body;
++            }
++
++            if (!labelsfound)
+ 				throw new SymbolicAnalysisFailedException();
+ 
+-			var rangeAnalysis = new MonoStateRangeAnalysis(body[0], StateRangeAnalysisMode.IteratorMoveNext, stateField, disposingField, disposeInFinallyVar);
+-			int pos = rangeAnalysis.AssignStateRanges(body, bodyLength);
+-			rangeAnalysis.EnsureLabelAtPos(body, ref pos, ref bodyLength);
+-
+-			labels = rangeAnalysis.CreateLabelRangeMapping(body, pos, bodyLength);
++			// this whole thing doesnt handle a few scenarioes I encountered - some not even obfuscated.
++			// example:
++			// switch (statefield, ..)
++			// ret 0  <- default case of the switch, throws the original off since it demands a return 0 label
++			// [body]
++			// [last_instruction_falls_through_to_retOneLabel_without_branch] // <- expects a br retOneLabel here
++			// retOneLabel:
++			// ret 1
++			// 
++			// this seems hard to fix without a complete rewrite of the yrd/staterangeanalysis.
++			var rangeAnalysis = new MonoStateRangeAnalysis(strippedbody[0], StateRangeAnalysisMode.IteratorMoveNext, stateField, disposingField, disposeInFinallyVar);
++			int pos = rangeAnalysis.AssignStateRanges(strippedbody, bodyLength);
++			rangeAnalysis.EnsureLabelAtPos(strippedbody, ref pos, ref bodyLength);
++
++			labels = rangeAnalysis.CreateLabelRangeMapping(strippedbody, pos, bodyLength);
+ 			stateVariables = rangeAnalysis.StateVariables;
+-			ConvertBody(body, pos, bodyLength);
+-		}
++			ConvertBody(strippedbody, pos, bodyLength);
++        }
+ 		List<ILVariable> stateVariables;
+ 		ILLabel returnFalseLabel, returnTrueLabel;
+ 		List<KeyValuePair<ILLabel, StateRange>> labels;
+ 		ILVariable disposeInFinallyVar;
+ 
+-		bool FindReturnLabels(List<ILNode> body, out int bodyLength, out ILLabel retZeroLabel, out ILLabel retOneLabel) {
+-			bodyLength = 0;
+-			retZeroLabel = null;
+-			retOneLabel = null;
+-			// MoveNext ends with 'lbl1: return 0; lbl2: return 1;' or 'lbl1: return 0;'
+-
+-			ILLabel lbl;
+-			int val;
+-			int pos = body.Count - 2;
+-			if (!GetReturnValueLabel(body, pos, out lbl, out val))
+-				return false;
+-			if (val == 0) {
+-				retZeroLabel = lbl;
+-				bodyLength = pos;
+-				return true;
+-			}
+-			else if (val == 1) {
+-				retOneLabel = lbl;
+-				pos -= 2;
+-				if (!GetReturnValueLabel(body, pos, out lbl, out val))
+-					return false;
+-				if (val != 0)
+-					return false;
+-				retZeroLabel = lbl;
+-				bodyLength = pos;
+-				return true;
+-			}
+-			else
+-				return false;
+-		}
+-
+-		bool GetReturnValueLabel(List<ILNode> body, int pos, out ILLabel lbl, out int val) {
+-			lbl = null;
+-			val = 0;
+-			if (pos < 0)
+-				return false;
+-			lbl = body[pos] as ILLabel;
+-			if (lbl == null)
+-				return false;
+-			ILExpression ldci4;
+-			return body[pos + 1].Match(ILCode.Ret, out ldci4) &&
+-				ldci4.Match(ILCode.Ldc_I4, out val);
+-		}
+-
+-		ILExpression CreateYieldReturn(ILExpression arg) => new ILExpression(ILCode.YieldReturn, null, arg);
++		bool FindReturnLabelsBB(List<ILNode> body, out ILLabel retZeroLabel, out ILLabel retOneLabel, out List<ILNode> strippedbody) {
++            retZeroLabel = null;
++            retOneLabel = null;
++
++            ILExpression retexp;
++            var rbbs = body.Cast<ILBasicBlock>().Where(bb => bb.Body.Count == 2 && bb.Body[1].Match(ILCode.Ret, out retexp) && retexp.Match(ILCode.Ldc_I4)).ToList();
++            var ret_lbls = rbbs.Select(bb => new System.Tuple<int, ILLabel>((int)(bb.Body[1] as ILExpression).Arguments[0].Operand, bb.Body[0] as ILLabel)).ToList();
++
++            strippedbody = DeBB(body.Except(rbbs).ToList());
++
++            if (ret_lbls.Count() == 1)
++            {
++                if (ret_lbls.Single().Item1 != 0)
++                    return false;
++
++                retZeroLabel = ret_lbls.Single().Item2;
++                return true;
++            }
++            else if (ret_lbls.Count() == 2)
++            {
++                if (ret_lbls.Where(l => l.Item1 == 0).Count() != 1 || ret_lbls.Where(l => l.Item1 == 1).Count() != 1)
++                    return false;
++
++                retZeroLabel = ret_lbls.Single(l => l.Item1 == 0).Item2;
++                retOneLabel = ret_lbls.Single(l => l.Item1 == 1).Item2;
++                return true;
++            }
++
++            return false;
++        }
++
++        bool FindReturnLabels(List<ILNode> body, out int bodyLength, out ILLabel retZeroLabel, out ILLabel retOneLabel)
++        {
++            bodyLength = body.Count;
++            retZeroLabel = null;
++            retOneLabel = null;
++            // MoveNext ends with 'lbl1: return 0; lbl2: return 1;' or 'lbl1: return 0;'
++            // ^ except when obfuscated. in our case it still observes the label: return x pattern, but position in the body may vary
++
++            for (int pos = body.Count - 1; pos > 0; pos--) // skip first instruction
++            {
++                int val;
++                ILLabel lbl;
++                if (GetReturnValueLabel(body, pos, out lbl, out val))
++                {
++                    if (val == 0 && retZeroLabel == null)
++                        retZeroLabel = lbl;
++                    else if (val == 1 && retOneLabel == null)
++                        retOneLabel = lbl;
++                    else
++                        return false;
++
++                    body.RemoveAt(pos);
++                    body.RemoveAt(pos);
++                    bodyLength -= 2;
++                }
++            }
++
++            return retZeroLabel != null || retOneLabel != null; // this may not be proper
++            /*ILLabel lbl;
++            int val;
++            int pos = body.Count - 2;
++            if (!GetReturnValueLabel(body, pos, out lbl, out val))
++                return false;
++            if (val == 0)
++            {
++                retZeroLabel = lbl;
++                bodyLength = pos;
++                return true;
++            }
++            else if (val == 1)
++            {
++                retOneLabel = lbl;
++                pos -= 2;
++                if (!GetReturnValueLabel(body, pos, out lbl, out val))
++                    return false;
++                if (val != 0)
++                    return false;
++                retZeroLabel = lbl;
++                bodyLength = pos;
++                return true;
++            }
++            else
++                return false;*/
++        }
++
++        bool GetReturnValueLabel(List<ILNode> body, int pos, out ILLabel lbl, out int val)
++        {
++            lbl = null;
++            val = 0;
++            if (pos < 0)
++                return false;
++            lbl = body[pos] as ILLabel;
++            if (lbl == null)
++                return false;
++            ILExpression ldci4;
++            return body[pos + 1].Match(ILCode.Ret, out ldci4) &&
++                ldci4.Match(ILCode.Ldc_I4, out val);
++        }
++
++        ILExpression CreateYieldReturn(ILExpression arg) => new ILExpression(ILCode.YieldReturn, null, arg);
+ 		ILExpression CreateYieldBreak() => new ILExpression(ILCode.YieldBreak, null);
+ 
+ 		void ConvertBody(List<ILNode> body, int startPos, int bodyLength) {
+diff --git a/ICSharpCode.Decompiler/ILAst/PeepholeTransform.cs b/ICSharpCode.Decompiler/ILAst/PeepholeTransform.cs
+index dbfe65f..9426b3a 100644
+--- a/ICSharpCode.Decompiler/ILAst/PeepholeTransform.cs
++++ b/ICSharpCode.Decompiler/ILAst/PeepholeTransform.cs
+@@ -350,9 +350,11 @@ void CachedDelegateInitializationWithField(ILBlock block, ref int i)
+ 				return;
+ 			if (newObj.Arguments[1].Code != ILCode.Ldftn)
+ 				return;
+-			MethodDef anonymousMethod = ((IMethod)newObj.Arguments[1].Operand).ResolveMethodWithinSameModule(); // method is defined in current assembly
++
++            // this seems plain wrong, delegate (and thus its ctor) isnt necessarily anonymous! could instead argue for a check against field actually being a delegate, though.
++			/*MethodDef anonymousMethod = ((IMethod)newObj.Arguments[1].Operand).ResolveMethodWithinSameModule(); // method is defined in current assembly
+ 			if (!Ast.Transforms.DelegateConstruction.IsAnonymousMethod(context, anonymousMethod))
+-				return;
++				return;*/
+ 			
+ 			ILNode followingNode = block.Body.ElementAtOrDefault(i + 1);
+ 			if (followingNode != null && followingNode.GetSelfAndChildrenRecursive<ILExpression>(Optimize_List_ILExpression).Count(
+@@ -428,9 +430,9 @@ void CachedDelegateInitializationWithLocal(ILBlock block, ref int i)
+ 				return;
+ 			if (newObj.Arguments[1].Code != ILCode.Ldftn)
+ 				return;
+-			MethodDef anonymousMethod = ((IMethod)newObj.Arguments[1].Operand).ResolveMethodWithinSameModule(); // method is defined in current assembly
++			/*MethodDef anonymousMethod = ((IMethod)newObj.Arguments[1].Operand).ResolveMethodWithinSameModule(); // method is defined in current assembly
+ 			if (!Ast.Transforms.DelegateConstruction.IsAnonymousMethod(context, anonymousMethod))
+-				return;
++				return;*/
+ 			
+ 			ILNode followingNode = block.Body.ElementAtOrDefault(i + 1);
+ 			if (followingNode != null && followingNode.GetSelfAndChildrenRecursive<ILExpression>().Count(
+diff --git a/ICSharpCode.Decompiler/ILAst/YieldReturnDecompiler.cs b/ICSharpCode.Decompiler/ILAst/YieldReturnDecompiler.cs
+index db39e93..4330ec3 100644
+--- a/ICSharpCode.Decompiler/ILAst/YieldReturnDecompiler.cs
++++ b/ICSharpCode.Decompiler/ILAst/YieldReturnDecompiler.cs
+@@ -17,6 +17,7 @@
+ // DEALINGS IN THE SOFTWARE.
+ 
+ using System;
++using System.Linq;
+ using System.Collections.Generic;
+ using System.Diagnostics;
+ using dnlib.DotNet;
+@@ -94,6 +95,13 @@ abstract class YieldReturnDecompiler {
+ 		}
+ 		#endregion
+ 
++        public static TypeDef YieldReturnType(DecompilerContext context, ILBlock method)
++        {
++            var yrd = TryCreate(context, method, null);
++
++            return yrd?.enumeratorType;
++        }
++
+ 		public static bool IsCompilerGeneratorEnumerator(TypeDef type) {
+ 			if (!(type.DeclaringType != null && type.IsCompilerGenerated()))
+ 				return false;
+@@ -139,15 +147,33 @@ abstract class YieldReturnDecompiler {
+ 			return ilMethod;
+ 		}
+ 
++        internal static List<ILNode> DeBB(ILBlock method) => DeBB(method.Body);
++
++        internal static List<ILNode> DeBB(List<ILNode> body)
++        {
++            var nodes = new List<ILNode>();
++
++            if (body.Count < 1 || !(body[0] is ILBasicBlock))
++                return body;
++
++            foreach (var bb in body.Cast<ILBasicBlock>())
++                nodes.AddRange(bb.Body);
++
++            return nodes;
++        }
++
+ 		protected bool InitializeFieldToParameterMap(ILBlock method, ILVariable enumVar, ref int i) =>
+-			InitializeFieldToParameterMap(method, enumVar, ref i, method.Body.Count);
++			InitializeFieldToParameterMap(method.Body, enumVar, ref i, method.Body.Count);
++
++        protected bool InitializeFieldToParameterMap(ILBlock method, ILVariable enumVar, ref int i, int end) =>
++            InitializeFieldToParameterMap(method.Body, enumVar, ref i, end);
+ 
+-		protected bool InitializeFieldToParameterMap(ILBlock method, ILVariable enumVar, ref int i, int end) {
++        protected bool InitializeFieldToParameterMap(List<ILNode> body, ILVariable enumVar, ref int i, int end) {
+ 			for (; i < end; i++) {
+ 				// stfld(..., ldloc(var_1), ldloc(parameter))
+ 				IField storedField;
+ 				ILExpression ldloc, loadParameter;
+-				if (!method.Body[i].Match(ILCode.Stfld, out storedField, out ldloc, out loadParameter))
++				if (!body[i].Match(ILCode.Stfld, out storedField, out ldloc, out loadParameter))
+ 					break;
+ 				ILVariable loadedVar, loadedArg;
+ 				if (!ldloc.Match(ILCode.Ldloc, out loadedVar))
+@@ -182,32 +208,41 @@ abstract class YieldReturnDecompiler {
+ 		void AnalyzeCurrentProperty() {
+ 			foreach (var getCurrentMethod in MethodUtils.GetMethod_get_Current(enumeratorType)) {
+ 				ILBlock method = CreateILAst(getCurrentMethod);
+-				if (method.Body.Count == 1) {
+-					// release builds directly return the current field
+-					ILExpression retExpr;
+-					IField field;
+-					ILExpression ldFromObj;
+-					if (method.Body[0].Match(ILCode.Ret, out retExpr) &&
+-						retExpr.Match(ILCode.Ldfld, out field, out ldFromObj) &&
+-						ldFromObj.MatchThis()) {
+-						currentField = GetFieldDefinition(field);
+-					}
+-				}
+-				else if (method.Body.Count == 2) {
+-					ILVariable v, v2;
+-					ILExpression stExpr;
+-					IField field;
+-					ILExpression ldFromObj;
+-					ILExpression retExpr;
+-					if (method.Body[0].Match(ILCode.Stloc, out v, out stExpr) &&
+-						stExpr.Match(ILCode.Ldfld, out field, out ldFromObj) &&
+-						ldFromObj.MatchThis() &&
+-						method.Body[1].Match(ILCode.Ret, out retExpr) &&
+-						retExpr.Match(ILCode.Ldloc, out v2) &&
+-						v == v2) {
+-						currentField = GetFieldDefinition(field);
+-					}
+-				}
++
++                var body = method.Body;
++                if (body.Count == 1 && body[0] is ILBasicBlock)
++                    body = (body[0] as ILBasicBlock).Body.SkipWhile(n => n is ILLabel).ToList();
++
++                if (body.Count == 1)
++                {
++                    // release builds directly return the current field
++                    ILExpression retExpr;
++                    IField field;
++                    ILExpression ldFromObj;
++                    if (body[0].Match(ILCode.Ret, out retExpr) &&
++                        retExpr.Match(ILCode.Ldfld, out field, out ldFromObj) &&
++                        ldFromObj.MatchThis())
++                    {
++                        currentField = GetFieldDefinition(field);
++                    }
++                }
++                else if (body.Count == 2)
++                {
++                    ILVariable v, v2;
++                    ILExpression stExpr;
++                    IField field;
++                    ILExpression ldFromObj;
++                    ILExpression retExpr;
++                    if (body[0].Match(ILCode.Stloc, out v, out stExpr) &&
++                        stExpr.Match(ILCode.Ldfld, out field, out ldFromObj) &&
++                        ldFromObj.MatchThis() &&
++                        body[1].Match(ILCode.Ret, out retExpr) &&
++                        retExpr.Match(ILCode.Ldloc, out v2) &&
++                        v == v2)
++                    {
++                        currentField = GetFieldDefinition(field);
++                    }
++                }
+ 				if (currentField != null)
+ 					break;
+ 			}
+@@ -221,6 +256,8 @@ abstract class YieldReturnDecompiler {
+ 			foreach (var getEnumeratorMethod in MethodUtils.GetMethod_GetEnumerator(enumeratorType)) {
+ 				bool found = false;
+ 				ILBlock method = CreateILAst(getEnumeratorMethod);
++                method.Body = DeBB(method);
++
+ 				foreach (ILNode node in method.Body) {
+ 					IField stField;
+ 					ILExpression stToObj;
